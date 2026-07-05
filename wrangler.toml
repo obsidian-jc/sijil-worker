@@ -1,0 +1,21 @@
+# Cloudflare Workers 설정 파일
+# 이 파일과 worker.js를 GitHub 저장소에 올리고, Cloudflare에서 "Git 저장소 가져오기"로
+# 연결하면 이후부터는 저장소에 파일만 새로 올리면 자동으로 배포됩니다.
+#
+# ⚠️ 주의: 이 파일에는 절대 토큰(NOTION_TOKEN, GITHUB_TOKEN) 같은 비밀 값을 적지 마세요.
+#         저장소가 공개(public)면 그대로 노출됩니다. 비밀 값은 반드시
+#         Cloudflare 대시보드 → 설정 → 변수 및 비밀 에서 "비밀(Secret)"로 등록하세요.
+
+name = "wonebailey-notion-proxy"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+# 아래는 비밀이 아닌 일반 설정 값들입니다.
+# (토큰 2개, 즉 NOTION_TOKEN과 GITHUB_TOKEN은 여기 넣지 말고 대시보드에서 "비밀"로 등록)
+[vars]
+GITHUB_REPO = "obsidian-jc/memo"
+GITHUB_BRANCH = "main"
+GITHUB_DIR = "받은편지함"
+DEFAULT_INBOX_PAGE_ID = ""
+PHOTO_PARENT_PAGE_ID = ""
+ALLOWED_ORIGIN = "*"

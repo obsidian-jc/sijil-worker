@@ -271,7 +271,7 @@ async function savePhotoToNotion(file, fileBuf, caption, env) {
 async function savePhotoToGithub(file, fileBuf, env) {
   const dir = (env.GITHUB_DIR || '받은편지함').replace(/\/$/, '') + '/photos';
   const branch = env.GITHUB_BRANCH || 'main';
-  const ts = Date.now();
+  const ts = todayTimestampKST();
   const safeName = (file.name || 'photo.jpg').replace(/[^\w.\-가-힣]/g, '_');
   const path = `${dir}/${ts}_${safeName}`;
   try {
@@ -333,6 +333,14 @@ function todayDateKST() {
   const now = new Date();
   const kst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
   return `${kst.getUTCFullYear()}-${String(kst.getUTCMonth() + 1).padStart(2, '0')}-${String(kst.getUTCDate()).padStart(2, '0')}`;
+}
+// 사진 파일명용: "2026-07-05_17-20-33" 형태 (밀리초 타임스탬프보다 사람이 읽기 좋음)
+function todayTimestampKST() {
+  const now = new Date();
+  const kst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+  const y = kst.getUTCFullYear(), mo = String(kst.getUTCMonth() + 1).padStart(2, '0'), d = String(kst.getUTCDate()).padStart(2, '0');
+  const h = String(kst.getUTCHours()).padStart(2, '0'), mi = String(kst.getUTCMinutes()).padStart(2, '0'), s = String(kst.getUTCSeconds()).padStart(2, '0');
+  return `${y}-${mo}-${d}_${h}-${mi}-${s}`;
 }
 function todayTitleKST() {
   const now = new Date();

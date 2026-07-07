@@ -1,20 +1,24 @@
 /**
- * 원베일리 시설일지 — 노션 + GitHub 동시 저장 프록시 (Cloudflare Worker)
+ * 원베일리 시설일지 — 노션 DB + GitHub 동시 저장 프록시 (Cloudflare Worker)
  *
  * 역할:
  *  - 브라우저는 CORS 정책 때문에 api.notion.com / api.github.com을 직접 호출할 수 없습니다.
  *  - 이 Worker가 대신 호출해주고, 토큰은 Worker의 시크릿에만 저장됩니다.
  *  - 웹앱(GitHub Pages 등 정적 사이트)은 이 Worker의 URL만 알면 됩니다.
  *
- * ── 새로 추가된 것 ──
- *  - /notion-inbox, /notion-photo 호출 시 노션 저장과 별개로
- *    GitHub 저장소(옵시디언 vault)에도 마크다운/사진을 자동 커밋합니다.
- *  - 노션이 막혀도 GitHub 저장은 독립적으로 시도되고, 반대도 마찬가지입니다.
+ * ── 이번에 바뀐 것 ──
+ *  - /notion-inbox 가 이제 "받은편지함 페이지에 글머리 기호로 추가"하는 대신,
+ *    "시설관리일지" 데이터베이스에 구조화된 항목(날짜/구분/내용)으로 새 페이지를 생성합니다.
+ *  - form.html에서 보내는 category 값(todo/task/contact/history/docs/inbox)을
+ *    데이터베이스의 "구분" 속성(일지/메모/할일)으로 매핑합니다.
+ *  - /notion-inbox 응답에 생성된 페이지 id(notion.pageId)를 포함해서,
+ *    뒤이어 오는 /notion-photo 요청이 그 페이지에 사진을 바로 첨부할 수 있게 했습니다.
+ *  - GitHub(옵시디언) 저장은 기존과 동일하게 독립적으로 계속 작동합니다.
  *
  * ── 필요한 환경변수 (wrangler secret / vars) ──
  *  NOTION_TOKEN          (secret) 노션 통합 토큰
- *  DEFAULT_INBOX_PAGE_ID  (var, 선택) 기본 받은편지함 페이지 ID
- *  PHOTO_PARENT_PAGE_ID   (var) 사진 페이지들의 부모 페이지 ID
+ *  NOTION_DB_ID           (var) "시설관리일지" 데이터베이스 ID
+ *  PHOTO_PARENT_PAGE_ID   (var) targetPageId가 없을 때 쓸 대체용 사진 부모 페이지 ID
  *  ALLOWED_ORIGIN         (var, 선택) CORS 허용 origin
  *
  *  GITHUB_TOKEN   (secret) GitHub Personal Access Token (해당 저장소 Contents 쓰기 권한)
@@ -25,6 +29,17 @@
  * 배포 방법은 README.md 참고.
  */
 const NOTION_VERSION = '2022-06-28';
+
+// form.html의 카테고리 key → 데이터베이스 "구분" 속성 값 매핑
+// (데이터베이스엔 일지/메모/할일 3개만 있어서, 폰 앱의 6개 카테고리를 이 셋으로 합쳐 넣음)
+const CATEGORY_TO_TYPE = {
+  todo: '할일',
+  task: '일지',
+  contact: '메모',
+  history: '일지',
+  docs: '메모',
+  inbox: '메모',
+};
 
 export default {
   async fetch(request, env) {
@@ -51,7 +66,7 @@ export default {
     if (url.pathname === '/debug') {
       return json({
         hasNotionToken: !!env.NOTION_TOKEN,
-        hasDefaultPageId: !!env.DEFAULT_INBOX_PAGE_ID,
+        hasNotionDbId: !!env.NOTION_DB_ID,
         hasPhotoParentPageId: !!env.PHOTO_PARENT_PAGE_ID,
         hasGithubToken: !!env.GITHUB_TOKEN,
         githubTokenLength: env.GITHUB_TOKEN ? env.GITHUB_TOKEN.length : 0,
@@ -66,7 +81,7 @@ export default {
 };
 
 // ══════════════════════════════════════════════════════
-// 받은편지함 텍스트 저장 (노션 + GitHub)
+// 받은편지함 텍스트 저장 (노션 DB + GitHub)
 // ══════════════════════════════════════════════════════
 async function handleInbox(request, env) {
   let body;
@@ -76,18 +91,16 @@ async function handleInbox(request, env) {
     return json({ error: '잘못된 요청 본문입니다.' }, 400, env);
   }
 
-  const pageId = (body.pageId || env.DEFAULT_INBOX_PAGE_ID || '').trim();
   const text = (body.text || '').toString();
+  const categoryKey = (body.category || 'inbox').toString();
 
   if (!text) return json({ error: 'text가 필요합니다.' }, 400, env);
   if (text.length > 1900) return json({ error: '내용이 너무 깁니다 (2000자 제한).' }, 400, env);
 
-  // ── 1) 노션 저장 ──
-  let notionResult = { ok: false, error: 'NOTION_TOKEN 미설정' };
-  if (env.NOTION_TOKEN && pageId) {
-    notionResult = await saveToNotion(pageId, text, env);
-  } else if (!pageId) {
-    notionResult = { ok: false, error: 'pageId가 필요합니다.' };
+  // ── 1) 노션 데이터베이스에 구조화된 항목으로 저장 ──
+  let notionResult = { ok: false, error: 'NOTION_TOKEN/NOTION_DB_ID 미설정' };
+  if (env.NOTION_TOKEN && env.NOTION_DB_ID) {
+    notionResult = await saveToNotionDatabase(text, categoryKey, env);
   }
 
   // ── 2) GitHub(옵시디언) 저장 — 노션 성패와 무관하게 독립 시도 ──
@@ -108,30 +121,36 @@ async function handleInbox(request, env) {
   return json({ ok: overallOk, notion: notionResult, github: githubResult }, overallOk ? 200 : 502, env);
 }
 
-async function saveToNotion(pageId, text, env) {
+// "시설관리일지" 데이터베이스에 새 페이지(항목)를 생성
+async function saveToNotionDatabase(text, categoryKey, env) {
   try {
-    const notionRes = await fetch(`https://api.notion.com/v1/blocks/${pageId}/children`, {
-      method: 'PATCH',
+    const dateStr = todayDateKST();
+    const type = CATEGORY_TO_TYPE[categoryKey] || '메모';
+    const titleText = text.length > 60 ? text.slice(0, 60) + '…' : text;
+
+    const res = await fetch('https://api.notion.com/v1/pages', {
+      method: 'POST',
       headers: {
         Authorization: `Bearer ${env.NOTION_TOKEN}`,
         'Notion-Version': NOTION_VERSION,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        children: [
-          {
-            object: 'block',
-            type: 'bulleted_list_item',
-            bulleted_list_item: { rich_text: [{ text: { content: text } }] },
-          },
-        ],
+        parent: { database_id: env.NOTION_DB_ID },
+        properties: {
+          '제목': { title: [{ text: { content: titleText } }] },
+          '날짜': { date: { start: dateStr } },
+          '구분': { select: { name: type } },
+          '내용': { rich_text: [{ text: { content: text } }] },
+        },
       }),
     });
-    const resultText = await notionRes.text();
-    if (!notionRes.ok) {
-      return { ok: false, error: `노션 API 오류 (${notionRes.status})`, detail: safeJsonParse(resultText) };
+    const resultText = await res.text();
+    if (!res.ok) {
+      return { ok: false, error: `노션 API 오류 (${res.status})`, detail: safeJsonParse(resultText) };
     }
-    return { ok: true };
+    const created = JSON.parse(resultText);
+    return { ok: true, pageId: created.id, type };
   } catch (e) {
     return { ok: false, error: String(e) };
   }
@@ -200,6 +219,7 @@ async function handlePhoto(request, env) {
   }
 
   const caption = (form.get('caption') || '').toString();
+  const targetPageId = (form.get('targetPageId') || '').toString().trim();
   const file = form.get('file');
   if (!file || typeof file === 'string') return json({ error: 'file이 필요합니다.' }, 400, env);
 
@@ -210,10 +230,11 @@ async function handlePhoto(request, env) {
 
   const fileBuf = await file.arrayBuffer();
 
-  // ── 1) 노션 저장 ──
-  let notionResult = { ok: false, error: 'NOTION_TOKEN/PHOTO_PARENT_PAGE_ID 미설정' };
-  if (env.NOTION_TOKEN && env.PHOTO_PARENT_PAGE_ID) {
-    notionResult = await savePhotoToNotion(file, fileBuf, caption, env);
+  // ── 1) 노션 저장: targetPageId가 있으면 그 항목(방금 생성된 DB 페이지)에 바로 첨부,
+  //     없으면 예전처럼 날짜별 사진 모음 페이지에 첨부 ──
+  let notionResult = { ok: false, error: 'NOTION_TOKEN 미설정' };
+  if (env.NOTION_TOKEN) {
+    notionResult = await savePhotoToNotion(file, fileBuf, caption, targetPageId, env);
   }
 
   // ── 2) GitHub 저장 ──
@@ -226,10 +247,14 @@ async function handlePhoto(request, env) {
   return json({ ok: overallOk, notion: notionResult, github: githubResult }, overallOk ? 200 : 502, env);
 }
 
-async function savePhotoToNotion(file, fileBuf, caption, env) {
+async function savePhotoToNotion(file, fileBuf, caption, targetPageId, env) {
   const notionHeaders = { Authorization: `Bearer ${env.NOTION_TOKEN}`, 'Notion-Version': NOTION_VERSION };
   try {
-    let pageId = await findOrCreateTodayPhotoPage(env);
+    let pageId = targetPageId;
+    if (!pageId) {
+      if (!env.PHOTO_PARENT_PAGE_ID) return { ok: false, error: 'targetPageId도 없고 PHOTO_PARENT_PAGE_ID도 미설정' };
+      pageId = await findOrCreateTodayPhotoPage(env);
+    }
 
     const createRes = await fetch('https://api.notion.com/v1/file_uploads', {
       method: 'POST',
@@ -262,7 +287,7 @@ async function savePhotoToNotion(file, fileBuf, caption, env) {
     });
     const attachText = await attachRes.text();
     if (!attachRes.ok) return { ok: false, error: `사진 첨부 실패 (${attachRes.status})`, detail: safeJsonParse(attachText) };
-    return { ok: true, fileUploadId };
+    return { ok: true, fileUploadId, pageId };
   } catch (e) {
     return { ok: false, error: String(e) };
   }

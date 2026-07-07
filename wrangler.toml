@@ -6,7 +6,7 @@
 #         저장소가 공개(public)면 그대로 노출됩니다. 비밀 값은 반드시
 #         Cloudflare 대시보드 → 설정 → 변수 및 비밀 에서 "비밀(Secret)"로 등록하세요.
 
-name = "wonebailey-notion-proxy"
+name = "sijil-worker"
 main = "worker.js"
 compatibility_date = "2026-01-01"
 
